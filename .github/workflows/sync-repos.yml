@@ -1,12 +1,10 @@
 name: Sync All Repos — Source → Destination
 
-# ── Triggers ──────────────────────────────────────────────────────────────────
 on:
-  # 3:00 AM IST daily  =  21:30 UTC  (IST = UTC + 5:30)
+  # 3:00 AM IST daily = 21:30 UTC
   schedule:
     - cron: "30 21 * * *"
 
-  # Manual run from the Actions tab
   workflow_dispatch:
     inputs:
       dry_run:
@@ -22,69 +20,108 @@ on:
         type: choice
         options: ["false", "true"]
 
-# ── Job ───────────────────────────────────────────────────────────────────────
 jobs:
   sync:
     name: Mirror repositories
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
 
     steps:
-      # ── 1. Install GitHub CLI (pre-installed on ubuntu-latest, just confirm) ──
       - name: Verify tools
         run: |
-          git  --version
-          gh   --version
-          jq   --version
+          git --version
+          jq  --version
+          curl --version | head -1
 
-      # ── 2. Fetch all source repos via GitHub API ──────────────────────────────
+      # ── Fetch ALL repos (handles both user & org accounts, all pages) ─────────
       - name: Fetch source repo list
         id: list
         env:
           SOURCE_TOKEN: ${{ secrets.SOURCE_GITHUB_TOKEN }}
           SOURCE_USER:  ${{ vars.SOURCE_GITHUB_USER }}
         run: |
+          set -euo pipefail
           echo "Fetching repos for: $SOURCE_USER"
 
-          # Paginate through all pages (100 per page max)
+          # Detect whether this is a user or org account
+          ACCOUNT_TYPE=$(curl -sf \
+            -H "Authorization: Bearer $SOURCE_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/users/$SOURCE_USER" | jq -r '.type')
+
+          echo "Account type: $ACCOUNT_TYPE"
+
           page=1
-          all_repos="[]"
+          > /tmp/source_repos.json   # start with empty file
+
           while true; do
-            chunk=$(curl -s \
+            echo "  Fetching page $page ..."
+
+            if [ "$ACCOUNT_TYPE" = "Organization" ]; then
+              # Org endpoint — returns ALL repos (public + private the token can see)
+              API_URL="https://api.github.com/orgs/$SOURCE_USER/repos?per_page=100&page=$page&type=all"
+            else
+              # User endpoint — use /user/repos when the token IS the source user
+              # This returns everything including private repos
+              API_URL="https://api.github.com/user/repos?per_page=100&page=$page&affiliation=owner"
+            fi
+
+            HTTP_STATUS=$(curl -s -o /tmp/page.json -w "%{http_code}" \
               -H "Authorization: Bearer $SOURCE_TOKEN" \
               -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/users/$SOURCE_USER/repos?per_page=100&page=$page&type=owner")
+              "$API_URL")
 
-            # Stop if the response is not a JSON array (error object or empty)
-            if ! echo "$chunk" | jq -e 'if type == "array" then true else error end' > /dev/null 2>&1; then
-              echo "  Page $page: no more results (end of pages)"
+            echo "  HTTP status: $HTTP_STATUS"
+
+            # Bail on auth / server errors
+            if [ "$HTTP_STATUS" = "401" ] || [ "$HTTP_STATUS" = "403" ]; then
+              echo "ERROR: Token rejected (HTTP $HTTP_STATUS). Check SOURCE_GITHUB_TOKEN scopes."
+              cat /tmp/page.json
+              exit 1
+            fi
+
+            # Stop if response is not a JSON array
+            if ! jq -e 'type == "array"' /tmp/page.json > /dev/null 2>&1; then
+              echo "  Non-array response on page $page — stopping pagination."
+              echo "  Response: $(cat /tmp/page.json)"
               break
             fi
 
-            count=$(echo "$chunk" | jq 'length')
+            count=$(jq 'length' /tmp/page.json)
             echo "  Page $page: $count repos"
 
-            # Stop if the page came back empty
+            # Stop on empty page
             [ "$count" -eq 0 ] && break
 
-            # Merge this page into all_repos
-            all_repos=$(printf '%s\n%s' "$all_repos" "$chunk" | jq -s 'add')
+            # Append this page's repos into the master file
+            if [ -s /tmp/source_repos.json ]; then
+              # File already has content — merge arrays
+              jq -s '.[0] + .[1]' /tmp/source_repos.json /tmp/page.json > /tmp/source_repos_merged.json
+              mv /tmp/source_repos_merged.json /tmp/source_repos.json
+            else
+              cp /tmp/page.json /tmp/source_repos.json
+            fi
 
-            # If fewer than 100 results, this was the last page
+            # Last page if fewer than 100 results
             [ "$count" -lt 100 ] && break
+
             page=$((page + 1))
+            sleep 0.5   # be polite to the API
           done
 
-          total=$(echo "$all_repos" | jq 'length')
-          echo "Total repos found: $total"
+          total=$(jq 'length' /tmp/source_repos.json)
+          echo "Total repos fetched: $total"
 
-          # Save full list and a names-only list
-          echo "$all_repos" | jq '.' > /tmp/source_repos.json
-          echo "$all_repos" | jq -r '.[].name' > /tmp/source_repo_names.txt
+          # Write names list for the sync step
+          jq -r '.[].name' /tmp/source_repos.json > /tmp/source_repo_names.txt
 
-          echo "total=$total" >> $GITHUB_OUTPUT
+          echo "--- Repo list ---"
+          cat /tmp/source_repo_names.txt
+          echo "-----------------"
 
-      # ── 3. Sync every repo ────────────────────────────────────────────────────
+          echo "total=$total" >> "$GITHUB_OUTPUT"
+
+      # ── Sync every repo ───────────────────────────────────────────────────────
       - name: Sync repositories
         env:
           SOURCE_TOKEN: ${{ secrets.SOURCE_GITHUB_TOKEN }}
@@ -94,10 +131,8 @@ jobs:
           DRY_RUN:      ${{ github.event.inputs.dry_run || 'false' }}
           FORCE_SYNC:   ${{ github.event.inputs.force_sync || 'false' }}
         run: |
-          # ── Colour helpers ───────────────────────────────────────────────────
-          GREEN="\033[0;32m" YELLOW="\033[0;33m" RED="\033[0;31m" NC="\033[0m"
+          set -uo pipefail
 
-          # ── Counters ─────────────────────────────────────────────────────────
           COUNT_NEW=0; COUNT_SYNCED=0; COUNT_SKIPPED=0; COUNT_FAILED=0
 
           SUMMARY_FILE="/tmp/sync_summary.md"
@@ -106,57 +141,60 @@ jobs:
           echo "| Repo | Status | Note |" >> "$SUMMARY_FILE"
           echo "|------|--------|------|" >> "$SUMMARY_FILE"
 
-          # ── Loop over every source repo ──────────────────────────────────────
           while IFS= read -r REPO_NAME; do
+            [ -z "$REPO_NAME" ] && continue
+
             echo ""
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             echo "  Repo: $REPO_NAME"
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-            # Read metadata from cached JSON
             META=$(jq -r --arg n "$REPO_NAME" '.[] | select(.name==$n)' /tmp/source_repos.json)
             IS_FORK=$(echo    "$META" | jq -r '.fork')
             IS_PRIVATE=$(echo "$META" | jq -r '.private')
+            IS_EMPTY=$(echo   "$META" | jq -r '.size == 0')
             DESCRIPTION=$(echo "$META" | jq -r '.description // ""')
 
-            # Skip forks (change to `false` if you want to include them)
+            # Skip forks
             if [ "$IS_FORK" = "true" ]; then
-              echo -e "  ${YELLOW}SKIP${NC} — fork"
+              echo "  SKIP — fork"
               COUNT_SKIPPED=$((COUNT_SKIPPED + 1))
               echo "| \`$REPO_NAME\` | ⏭ Skipped | Fork |" >> "$SUMMARY_FILE"
               continue
             fi
 
             if [ "$DRY_RUN" = "true" ]; then
-              echo -e "  ${YELLOW}DRY RUN${NC} — would sync this repo"
+              echo "  DRY RUN — would sync"
               COUNT_SKIPPED=$((COUNT_SKIPPED + 1))
               echo "| \`$REPO_NAME\` | 🔍 Dry run | Would sync |" >> "$SUMMARY_FILE"
               continue
             fi
 
-            # ── Check if dest repo already exists ──────────────────────────────
+            # Check if dest repo already exists
             DEST_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Authorization: Bearer $DEST_TOKEN" \
               "https://api.github.com/repos/$DEST_USER/$REPO_NAME")
 
             if [ "$DEST_EXISTS" != "200" ]; then
-              # ── NEW: create destination repo ─────────────────────────────────
               echo "  → Creating repo on destination..."
-              CREATE_RESP=$(curl -s -w "\n%{http_code}" \
+              # Escape description for JSON
+              SAFE_DESC=$(echo "$DESCRIPTION" | jq -Rs '.')
+              CREATE_BODY=$(jq -n \
+                --arg name "$REPO_NAME" \
+                --argjson desc "$SAFE_DESC" \
+                --argjson private "$IS_PRIVATE" \
+                '{name: $name, description: $desc, private: $private, auto_init: false}')
+
+              HTTP_CODE=$(curl -s -o /tmp/create_resp.json -w "%{http_code}" \
                 -X POST \
                 -H "Authorization: Bearer $DEST_TOKEN" \
                 -H "Accept: application/vnd.github+json" \
                 "https://api.github.com/user/repos" \
-                -d "{
-                  \"name\":        \"$REPO_NAME\",
-                  \"description\": \"$DESCRIPTION\",
-                  \"private\":     $IS_PRIVATE,
-                  \"auto_init\":   false
-                }")
-              HTTP_CODE=$(echo "$CREATE_RESP" | tail -1)
+                -d "$CREATE_BODY")
+
               if [ "$HTTP_CODE" != "201" ]; then
-                echo -e "  ${RED}FAILED${NC} — could not create repo (HTTP $HTTP_CODE)"
-                echo "$CREATE_RESP" | head -1 | jq '.message' 2>/dev/null || true
+                echo "  FAILED — could not create repo (HTTP $HTTP_CODE)"
+                jq -r '.message // "unknown error"' /tmp/create_resp.json
                 COUNT_FAILED=$((COUNT_FAILED + 1))
                 echo "| \`$REPO_NAME\` | ❌ Failed | Create error HTTP $HTTP_CODE |" >> "$SUMMARY_FILE"
                 continue
@@ -164,65 +202,64 @@ jobs:
               echo "  ✓ Repo created on destination"
               REPO_ACTION="new"
             else
-              if [ "$FORCE_SYNC" = "false" ]; then
-                REPO_ACTION="sync"
-              else
-                REPO_ACTION="force_sync"
-              fi
+              REPO_ACTION="sync"
             fi
 
-            # ── Clone source (mirror) and push to destination ──────────────────
-            TMPDIR=$(mktemp -d)
+            # Skip empty repos (nothing to clone)
+            if [ "$IS_EMPTY" = "true" ]; then
+              echo "  SKIP — repo is empty (no commits)"
+              COUNT_SKIPPED=$((COUNT_SKIPPED + 1))
+              echo "| \`$REPO_NAME\` | ⏭ Skipped | Empty repo |" >> "$SUMMARY_FILE"
+              continue
+            fi
 
-            SRC_URL="https://${SOURCE_TOKEN}@github.com/${SOURCE_USER}/${REPO_NAME}.git"
-            DST_URL="https://${DEST_TOKEN}@github.com/${DEST_USER}/${REPO_NAME}.git"
+            WORK_DIR=$(mktemp -d)
+            SRC_URL="https://x-token-auth:${SOURCE_TOKEN}@github.com/${SOURCE_USER}/${REPO_NAME}.git"
+            DST_URL="https://x-token-auth:${DEST_TOKEN}@github.com/${DEST_USER}/${REPO_NAME}.git"
 
             echo "  → Cloning (mirror)..."
-            if ! git clone --mirror "$SRC_URL" "$TMPDIR" 2>&1; then
-              echo -e "  ${RED}FAILED${NC} — git clone error"
+            if ! git clone --mirror "$SRC_URL" "$WORK_DIR" 2>&1; then
+              echo "  FAILED — git clone error"
               COUNT_FAILED=$((COUNT_FAILED + 1))
               echo "| \`$REPO_NAME\` | ❌ Failed | Clone error |" >> "$SUMMARY_FILE"
-              rm -rf "$TMPDIR"
+              rm -rf "$WORK_DIR"
               continue
             fi
 
             echo "  → Pushing to destination..."
-            if ! git -C "$TMPDIR" push --mirror "$DST_URL" 2>&1; then
-              echo -e "  ${RED}FAILED${NC} — git push error"
+            if ! git -C "$WORK_DIR" push --mirror "$DST_URL" 2>&1; then
+              echo "  FAILED — git push error"
               COUNT_FAILED=$((COUNT_FAILED + 1))
               echo "| \`$REPO_NAME\` | ❌ Failed | Push error |" >> "$SUMMARY_FILE"
-              rm -rf "$TMPDIR"
+              rm -rf "$WORK_DIR"
               continue
             fi
 
-            rm -rf "$TMPDIR"
+            rm -rf "$WORK_DIR"
 
             if [ "$REPO_ACTION" = "new" ]; then
-              echo -e "  ${GREEN}✓ NEW${NC} — created and mirrored"
+              echo "  ✓ NEW — created and mirrored"
               COUNT_NEW=$((COUNT_NEW + 1))
               echo "| \`$REPO_NAME\` | ✅ New | Created + mirrored |" >> "$SUMMARY_FILE"
             else
-              echo -e "  ${GREEN}✓ SYNCED${NC} — all branches and tags updated"
+              echo "  ✓ SYNCED — branches and tags updated"
               COUNT_SYNCED=$((COUNT_SYNCED + 1))
-              echo "| \`$REPO_NAME\` | 🔄 Synced | Branches + tags updated |" >> "$SUMMARY_FILE"
+              echo "| \`$REPO_NAME\` | 🔄 Synced | Updated |" >> "$SUMMARY_FILE"
             fi
 
-            # Polite pause — avoid secondary rate limits
             sleep 1
 
           done < /tmp/source_repo_names.txt
 
-          # ── Final summary ────────────────────────────────────────────────────
           echo ""
           echo "════════════════════════════════════════════"
           echo "  SYNC COMPLETE"
-          echo "  New repos    : $COUNT_NEW"
-          echo "  Synced       : $COUNT_SYNCED"
-          echo "  Skipped      : $COUNT_SKIPPED"
-          echo "  Failed       : $COUNT_FAILED"
+          echo "  New     : $COUNT_NEW"
+          echo "  Synced  : $COUNT_SYNCED"
+          echo "  Skipped : $COUNT_SKIPPED"
+          echo "  Failed  : $COUNT_FAILED"
           echo "════════════════════════════════════════════"
 
-          # Append totals to summary
           echo "" >> "$SUMMARY_FILE"
           echo "## Totals" >> "$SUMMARY_FILE"
           echo "- ✅ New: $COUNT_NEW" >> "$SUMMARY_FILE"
@@ -230,13 +267,10 @@ jobs:
           echo "- ⏭ Skipped: $COUNT_SKIPPED" >> "$SUMMARY_FILE"
           echo "- ❌ Failed: $COUNT_FAILED" >> "$SUMMARY_FILE"
 
-          # Expose summary to GitHub step summary UI
           cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
 
-          # Fail the job if any repo failed
           [ "$COUNT_FAILED" -eq 0 ] || exit 1
 
-      # ── 4. Upload sync summary as downloadable artifact ──────────────────────
       - name: Upload sync summary
         if: always()
         uses: actions/upload-artifact@v4
