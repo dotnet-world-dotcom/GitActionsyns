@@ -29,99 +29,119 @@ jobs:
     steps:
       - name: Verify tools
         run: |
-          git --version
-          jq  --version
+          git  --version
+          jq   --version
           curl --version | head -1
 
-      # ── Fetch ALL repos (handles both user & org accounts, all pages) ─────────
-      - name: Fetch source repo list
-        id: list
+      # ── Step 1: Detect account type ───────────────────────────────────────────
+      - name: Detect source account type
+        id: account
         env:
           SOURCE_TOKEN: ${{ secrets.SOURCE_GITHUB_TOKEN }}
           SOURCE_USER:  ${{ vars.SOURCE_GITHUB_USER }}
         run: |
-          set -euo pipefail
-          echo "Fetching repos for: $SOURCE_USER"
+          echo "Checking account: $SOURCE_USER"
 
-          # Detect whether this is a user or org account
-          ACCOUNT_TYPE=$(curl -sf \
+          RESP=$(curl -s \
             -H "Authorization: Bearer $SOURCE_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/users/$SOURCE_USER" | jq -r '.type')
+            "https://api.github.com/users/$SOURCE_USER")
 
+          echo "Response: $RESP"
+
+          # Default to User if .type missing
+          ACCOUNT_TYPE=$(echo "$RESP" | jq -r 'if .type then .type else "User" end')
           echo "Account type: $ACCOUNT_TYPE"
+          echo "account_type=$ACCOUNT_TYPE" >> "$GITHUB_OUTPUT"
+
+      # ── Step 2: Fetch ALL repos page by page ──────────────────────────────────
+      - name: Fetch source repo list
+        id: list
+        env:
+          SOURCE_TOKEN:  ${{ secrets.SOURCE_GITHUB_TOKEN }}
+          SOURCE_USER:   ${{ vars.SOURCE_GITHUB_USER }}
+          ACCOUNT_TYPE:  ${{ steps.account.outputs.account_type }}
+        run: |
+          echo "Fetching repos for: $SOURCE_USER (type: $ACCOUNT_TYPE)"
+
+          # Start with an empty array file
+          echo "[]" > /tmp/source_repos.json
 
           page=1
-          > /tmp/source_repos.json   # start with empty file
-
           while true; do
-            echo "  Fetching page $page ..."
+            echo ""
+            echo "  → Fetching page $page ..."
 
             if [ "$ACCOUNT_TYPE" = "Organization" ]; then
-              # Org endpoint — returns ALL repos (public + private the token can see)
-              API_URL="https://api.github.com/orgs/$SOURCE_USER/repos?per_page=100&page=$page&type=all"
+              API_URL="https://api.github.com/orgs/${SOURCE_USER}/repos?per_page=100&page=${page}&type=all"
             else
-              # User endpoint — use /user/repos when the token IS the source user
-              # This returns everything including private repos
-              API_URL="https://api.github.com/user/repos?per_page=100&page=$page&affiliation=owner"
+              # /user/repos returns ALL repos the token owner owns (public + private)
+              API_URL="https://api.github.com/user/repos?per_page=100&page=${page}&affiliation=owner"
             fi
 
-            HTTP_STATUS=$(curl -s -o /tmp/page.json -w "%{http_code}" \
+            echo "  URL: $API_URL"
+
+            HTTP_STATUS=$(curl -s \
+              -o /tmp/page.json \
+              -w "%{http_code}" \
               -H "Authorization: Bearer $SOURCE_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "$API_URL")
 
             echo "  HTTP status: $HTTP_STATUS"
 
-            # Bail on auth / server errors
-            if [ "$HTTP_STATUS" = "401" ] || [ "$HTTP_STATUS" = "403" ]; then
-              echo "ERROR: Token rejected (HTTP $HTTP_STATUS). Check SOURCE_GITHUB_TOKEN scopes."
+            # Show response on error
+            if [ "$HTTP_STATUS" != "200" ]; then
+              echo "  ERROR response body:"
               cat /tmp/page.json
-              exit 1
+              echo ""
+              echo "  Non-200 status on page $page. Stopping."
+              break
             fi
 
-            # Stop if response is not a JSON array
-            if ! jq -e 'type == "array"' /tmp/page.json > /dev/null 2>&1; then
-              echo "  Non-array response on page $page — stopping pagination."
-              echo "  Response: $(cat /tmp/page.json)"
+            # Ensure it is actually an array
+            IS_ARRAY=$(jq 'type == "array"' /tmp/page.json)
+            if [ "$IS_ARRAY" != "true" ]; then
+              echo "  Response is not an array. Stopping."
+              cat /tmp/page.json
               break
             fi
 
             count=$(jq 'length' /tmp/page.json)
-            echo "  Page $page: $count repos"
+            echo "  Repos on this page: $count"
 
-            # Stop on empty page
             [ "$count" -eq 0 ] && break
 
-            # Append this page's repos into the master file
-            if [ -s /tmp/source_repos.json ]; then
-              # File already has content — merge arrays
-              jq -s '.[0] + .[1]' /tmp/source_repos.json /tmp/page.json > /tmp/source_repos_merged.json
-              mv /tmp/source_repos_merged.json /tmp/source_repos.json
-            else
-              cp /tmp/page.json /tmp/source_repos.json
-            fi
+            # Merge page into master file
+            jq -s '.[0] + .[1]' /tmp/source_repos.json /tmp/page.json \
+              > /tmp/source_repos_tmp.json
+            mv /tmp/source_repos_tmp.json /tmp/source_repos.json
 
-            # Last page if fewer than 100 results
+            total_so_far=$(jq 'length' /tmp/source_repos.json)
+            echo "  Running total: $total_so_far repos"
+
+            # Last page?
             [ "$count" -lt 100 ] && break
 
             page=$((page + 1))
-            sleep 0.5   # be polite to the API
+            sleep 0.5
           done
 
-          total=$(jq 'length' /tmp/source_repos.json)
-          echo "Total repos fetched: $total"
+          echo ""
+          TOTAL=$(jq 'length' /tmp/source_repos.json)
+          echo "Total repos fetched: $TOTAL"
 
-          # Write names list for the sync step
+          # Write names to a file for the sync step
           jq -r '.[].name' /tmp/source_repos.json > /tmp/source_repo_names.txt
 
-          echo "--- Repo list ---"
+          echo ""
+          echo "=== Repo list ==="
           cat /tmp/source_repo_names.txt
-          echo "-----------------"
+          echo "================="
 
-          echo "total=$total" >> "$GITHUB_OUTPUT"
+          echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
 
-      # ── Sync every repo ───────────────────────────────────────────────────────
+      # ── Step 3: Sync every repo ───────────────────────────────────────────────
       - name: Sync repositories
         env:
           SOURCE_TOKEN: ${{ secrets.SOURCE_GITHUB_TOKEN }}
@@ -131,8 +151,6 @@ jobs:
           DRY_RUN:      ${{ github.event.inputs.dry_run || 'false' }}
           FORCE_SYNC:   ${{ github.event.inputs.force_sync || 'false' }}
         run: |
-          set -uo pipefail
-
           COUNT_NEW=0; COUNT_SYNCED=0; COUNT_SKIPPED=0; COUNT_FAILED=0
 
           SUMMARY_FILE="/tmp/sync_summary.md"
@@ -150,12 +168,11 @@ jobs:
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
             META=$(jq -r --arg n "$REPO_NAME" '.[] | select(.name==$n)' /tmp/source_repos.json)
-            IS_FORK=$(echo    "$META" | jq -r '.fork')
-            IS_PRIVATE=$(echo "$META" | jq -r '.private')
-            IS_EMPTY=$(echo   "$META" | jq -r '.size == 0')
+            IS_FORK=$(echo     "$META" | jq -r '.fork')
+            IS_PRIVATE=$(echo  "$META" | jq -r '.private')
+            IS_EMPTY=$(echo    "$META" | jq -r '.size == 0')
             DESCRIPTION=$(echo "$META" | jq -r '.description // ""')
 
-            # Skip forks
             if [ "$IS_FORK" = "true" ]; then
               echo "  SKIP — fork"
               COUNT_SKIPPED=$((COUNT_SKIPPED + 1))
@@ -171,19 +188,18 @@ jobs:
             fi
 
             # Check if dest repo already exists
-            DEST_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" \
+            DEST_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Authorization: Bearer $DEST_TOKEN" \
               "https://api.github.com/repos/$DEST_USER/$REPO_NAME")
 
-            if [ "$DEST_EXISTS" != "200" ]; then
+            if [ "$DEST_STATUS" != "200" ]; then
               echo "  → Creating repo on destination..."
-              # Escape description for JSON
               SAFE_DESC=$(echo "$DESCRIPTION" | jq -Rs '.')
               CREATE_BODY=$(jq -n \
-                --arg name "$REPO_NAME" \
-                --argjson desc "$SAFE_DESC" \
-                --argjson private "$IS_PRIVATE" \
-                '{name: $name, description: $desc, private: $private, auto_init: false}')
+                --arg  name    "$REPO_NAME" \
+                --arg  desc    "$DESCRIPTION" \
+                --argjson priv "$IS_PRIVATE" \
+                '{name: $name, description: $desc, private: $priv, auto_init: false}')
 
               HTTP_CODE=$(curl -s -o /tmp/create_resp.json -w "%{http_code}" \
                 -X POST \
@@ -196,10 +212,10 @@ jobs:
                 echo "  FAILED — could not create repo (HTTP $HTTP_CODE)"
                 jq -r '.message // "unknown error"' /tmp/create_resp.json
                 COUNT_FAILED=$((COUNT_FAILED + 1))
-                echo "| \`$REPO_NAME\` | ❌ Failed | Create error HTTP $HTTP_CODE |" >> "$SUMMARY_FILE"
+                echo "| \`$REPO_NAME\` | ❌ Failed | Create HTTP $HTTP_CODE |" >> "$SUMMARY_FILE"
                 continue
               fi
-              echo "  ✓ Repo created on destination"
+              echo "  ✓ Repo created"
               REPO_ACTION="new"
             else
               REPO_ACTION="sync"
@@ -207,9 +223,9 @@ jobs:
 
             # Skip empty repos (nothing to clone)
             if [ "$IS_EMPTY" = "true" ]; then
-              echo "  SKIP — repo is empty (no commits)"
+              echo "  SKIP — repo has no commits yet"
               COUNT_SKIPPED=$((COUNT_SKIPPED + 1))
-              echo "| \`$REPO_NAME\` | ⏭ Skipped | Empty repo |" >> "$SUMMARY_FILE"
+              echo "| \`$REPO_NAME\` | ⏭ Skipped | Empty |" >> "$SUMMARY_FILE"
               continue
             fi
 
@@ -219,7 +235,7 @@ jobs:
 
             echo "  → Cloning (mirror)..."
             if ! git clone --mirror "$SRC_URL" "$WORK_DIR" 2>&1; then
-              echo "  FAILED — git clone error"
+              echo "  FAILED — clone error"
               COUNT_FAILED=$((COUNT_FAILED + 1))
               echo "| \`$REPO_NAME\` | ❌ Failed | Clone error |" >> "$SUMMARY_FILE"
               rm -rf "$WORK_DIR"
@@ -228,7 +244,7 @@ jobs:
 
             echo "  → Pushing to destination..."
             if ! git -C "$WORK_DIR" push --mirror "$DST_URL" 2>&1; then
-              echo "  FAILED — git push error"
+              echo "  FAILED — push error"
               COUNT_FAILED=$((COUNT_FAILED + 1))
               echo "| \`$REPO_NAME\` | ❌ Failed | Push error |" >> "$SUMMARY_FILE"
               rm -rf "$WORK_DIR"
@@ -260,17 +276,20 @@ jobs:
           echo "  Failed  : $COUNT_FAILED"
           echo "════════════════════════════════════════════"
 
-          echo "" >> "$SUMMARY_FILE"
-          echo "## Totals" >> "$SUMMARY_FILE"
-          echo "- ✅ New: $COUNT_NEW" >> "$SUMMARY_FILE"
-          echo "- 🔄 Synced: $COUNT_SYNCED" >> "$SUMMARY_FILE"
-          echo "- ⏭ Skipped: $COUNT_SKIPPED" >> "$SUMMARY_FILE"
-          echo "- ❌ Failed: $COUNT_FAILED" >> "$SUMMARY_FILE"
+          {
+            echo ""
+            echo "## Totals"
+            echo "- ✅ New: $COUNT_NEW"
+            echo "- 🔄 Synced: $COUNT_SYNCED"
+            echo "- ⏭ Skipped: $COUNT_SKIPPED"
+            echo "- ❌ Failed: $COUNT_FAILED"
+          } >> "$SUMMARY_FILE"
 
           cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
 
           [ "$COUNT_FAILED" -eq 0 ] || exit 1
 
+      # ── Step 4: Upload summary artifact ──────────────────────────────────────
       - name: Upload sync summary
         if: always()
         uses: actions/upload-artifact@v4
