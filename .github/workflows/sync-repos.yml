@@ -55,11 +55,22 @@ jobs:
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/users/$SOURCE_USER/repos?per_page=100&page=$page&type=owner")
 
+            # Stop if the response is not a JSON array (error object or empty)
+            if ! echo "$chunk" | jq -e 'if type == "array" then true else error end' > /dev/null 2>&1; then
+              echo "  Page $page: no more results (end of pages)"
+              break
+            fi
+
             count=$(echo "$chunk" | jq 'length')
             echo "  Page $page: $count repos"
 
-            all_repos=$(echo "$all_repos $chunk" | jq -s 'add')
+            # Stop if the page came back empty
+            [ "$count" -eq 0 ] && break
 
+            # Merge this page into all_repos
+            all_repos=$(printf '%s\n%s' "$all_repos" "$chunk" | jq -s 'add')
+
+            # If fewer than 100 results, this was the last page
             [ "$count" -lt 100 ] && break
             page=$((page + 1))
           done
