@@ -33,7 +33,7 @@ jobs:
       - name: Install Required Packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq gh
+          sudo apt-get install -y jq gh python3-pip
 
       - name: Configure Git
         run: |
@@ -61,22 +61,6 @@ jobs:
           echo "AZURE DEVOPS REPOSITORY FETCH STARTED"
           echo "========================================"
 
-          echo "Azure Organization: $AZURE_ORG"
-          echo "Azure Project: $AZURE_PROJECT"
-          echo "GitHub Username: $GH_USERNAME"
-
-          echo ""
-          echo "========================================"
-          echo "GITHUB AUTH TEST"
-          echo "========================================"
-
-          gh auth status || true
-
-          echo ""
-          echo "========================================"
-          echo "FETCHING AZURE REPOSITORIES"
-          echo "========================================"
-
           ENCODED_PROJECT=$(printf '%s' "$AZURE_PROJECT" | jq -sRr @uri)
 
           RESPONSE=$(curl -s \
@@ -85,7 +69,6 @@ jobs:
 
           echo "$RESPONSE" > repos.json
 
-          echo ""
           echo "========================================"
           echo "AZURE API RESPONSE"
           echo "========================================"
@@ -100,41 +83,34 @@ jobs:
 
           REPO_COUNT=$(jq '.value | length' repos.json)
 
-          echo ""
-          echo "========================================"
           echo "TOTAL REPOSITORIES FOUND: $REPO_COUNT"
-          echo "========================================"
 
           if [ "$REPO_COUNT" -eq 0 ]; then
             echo "No repositories found."
             exit 1
           fi
 
-          echo ""
-          echo "Repositories Found:"
-          jq -r '.value[].name' repos.json
-
           jq -c '.value[]' repos.json > repo_items.txt
 
           while IFS= read -r repoJson
           do
+
             echo ""
             echo "========================================"
 
             REPO_NAME=$(echo "$repoJson" | jq -r '.name')
 
-            #Convert Azure repo name to GitHub-safe name
+            # Convert Azure repo name to GitHub-safe name
             GITHUB_REPO_NAME=$(echo "$REPO_NAME" | sed 's/[^a-zA-Z0-9._-]/-/g')
+
             REMOTE_URL=$(echo "$repoJson" | jq -r '.remoteUrl')
-           
 
             echo "PROCESSING REPOSITORY: $REPO_NAME"
-            echo "REMOTE URL: $REMOTE_URL"
+            echo "GITHUB REPOSITORY: $GITHUB_REPO_NAME"
 
             SAFE_NAME=$(echo "$REPO_NAME" | tr ' /' '__')
             MIRROR_PATH="mirrors/$SAFE_NAME.git"
 
-            echo ""
             echo "Preparing Mirror Repository..."
 
             if [ -d "$MIRROR_PATH" ]; then
@@ -164,16 +140,14 @@ jobs:
 
             echo "Clone Successful"
 
-            echo ""
             echo "Checking GitHub Repository..."
 
             if ! gh repo view "$GH_USERNAME/$GITHUB_REPO_NAME" >/dev/null 2>&1; then
 
               echo "Repository Not Found. Creating..."
 
-              gh repo create "$GH_USERNAME/$GITHUB_REPO_NAME" --private
-
-              echo "Repository Created"
+              gh repo create "$GH_USERNAME/$GITHUB_REPO_NAME" \
+                --private
 
             else
 
@@ -188,12 +162,28 @@ jobs:
             git for-each-ref --format='%(refname)' refs/pull/ | \
               xargs -r -n 1 git update-ref -d
 
+            echo "Installing git-filter-repo"
+
+            python3 -m pip install --upgrade git-filter-repo
+
+            echo "Removing Terraform Cache From History"
+
+            git filter-repo \
+              --path-glob '**/.terraform/**' \
+              --invert-paths \
+              --force || true
+
+            echo "Removing Files Larger Than 95MB"
+
+            git filter-repo \
+              --strip-blobs-bigger-than 95M \
+              --force || true
+
             git remote remove github 2>/dev/null || true
 
             git remote add github \
-               "https://$GH_USERNAME:$GH_TOKEN@github.com/$GH_USERNAME/$GITHUB_REPO_NAME.git"
+              "https://$GH_USERNAME:$GH_TOKEN@github.com/$GH_USERNAME/$GITHUB_REPO_NAME.git"
 
-            echo ""
             echo "========================================"
             echo "PUSHING BRANCHES"
             echo "========================================"
@@ -203,7 +193,6 @@ jobs:
               --force \
               --verbose
 
-            echo ""
             echo "========================================"
             echo "PUSHING TAGS"
             echo "========================================"
@@ -213,7 +202,6 @@ jobs:
               --force \
               --verbose
 
-            echo ""
             echo "========================================"
             echo "REPOSITORY SYNC COMPLETED"
             echo "========================================"
@@ -225,8 +213,6 @@ jobs:
 
           done < repo_items.txt
 
-          echo ""
           echo "========================================"
           echo "ALL REPOSITORIES SYNCED SUCCESSFULLY"
           echo "========================================"
-
