@@ -1,299 +1,303 @@
-name: Sync All Repos — Source → Destination
+name: Azure DevOps Repo Sync
 
 on:
-  # 3:00 AM IST daily = 21:30 UTC
-  schedule:
-    - cron: "30 21 * * *"
 
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Dry run — list repos without syncing"
-        required: false
-        default: "false"
-        type: choice
-        options: ["false", "true"]
-      force_sync:
-        description: "Force re-sync repos that already exist on destination"
-        required: false
-        default: "false"
-        type: choice
-        options: ["false", "true"]
+
+  schedule:
+
+    # Daily at 2 AM IST
+    - cron: '30 20 * * *'
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+
   sync:
-    name: Mirror repositories
+
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+
+    timeout-minutes: 720
+
+    env:
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
 
     steps:
-      - name: Verify tools
-        run: |
-          git  --version
-          jq   --version
-          curl --version | head -1
 
-      # ── Step 1: Detect account type ───────────────────────────────────────────
-      - name: Detect source account type
-        id: account
-        env:
-          SOURCE_TOKEN: ${{ secrets.SOURCE_GITHUB_TOKEN }}
-          SOURCE_USER:  ${{ vars.SOURCE_GITHUB_USER }}
-        run: |
-          echo "Checking account: $SOURCE_USER"
+      - name: Checkout Workflow Repository
+        uses: actions/checkout@v5
 
-          RESP=$(curl -s \
-            -H "Authorization: Bearer $SOURCE_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/users/$SOURCE_USER")
-
-          echo "Response: $RESP"
-
-          # Default to User if .type missing
-          ACCOUNT_TYPE=$(echo "$RESP" | jq -r 'if .type then .type else "User" end')
-          echo "Account type: $ACCOUNT_TYPE"
-          echo "account_type=$ACCOUNT_TYPE" >> "$GITHUB_OUTPUT"
-
-      # ── Step 2: Fetch ALL repos page by page ──────────────────────────────────
-      - name: Fetch source repo list
-        id: list
-        env:
-          SOURCE_TOKEN:  ${{ secrets.SOURCE_GITHUB_TOKEN }}
-          SOURCE_USER:   ${{ vars.SOURCE_GITHUB_USER }}
-          ACCOUNT_TYPE:  ${{ steps.account.outputs.account_type }}
-        run: |
-          echo "Fetching repos for: $SOURCE_USER (type: $ACCOUNT_TYPE)"
-
-          # Start with an empty array file
-          echo "[]" > /tmp/source_repos.json
-
-          page=1
-          while true; do
-            echo ""
-            echo "  → Fetching page $page ..."
-
-            if [ "$ACCOUNT_TYPE" = "Organization" ]; then
-              API_URL="https://api.github.com/orgs/${SOURCE_USER}/repos?per_page=100&page=${page}&type=all"
-            else
-              # /user/repos returns ALL repos the token owner owns (public + private)
-              API_URL="https://api.github.com/user/repos?per_page=100&page=${page}&affiliation=owner"
-            fi
-
-            echo "  URL: $API_URL"
-
-            HTTP_STATUS=$(curl -s \
-              -o /tmp/page.json \
-              -w "%{http_code}" \
-              -H "Authorization: Bearer $SOURCE_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "$API_URL")
-
-            echo "  HTTP status: $HTTP_STATUS"
-
-            # Show response on error
-            if [ "$HTTP_STATUS" != "200" ]; then
-              echo "  ERROR response body:"
-              cat /tmp/page.json
-              echo ""
-              echo "  Non-200 status on page $page. Stopping."
-              break
-            fi
-
-            # Ensure it is actually an array
-            IS_ARRAY=$(jq 'type == "array"' /tmp/page.json)
-            if [ "$IS_ARRAY" != "true" ]; then
-              echo "  Response is not an array. Stopping."
-              cat /tmp/page.json
-              break
-            fi
-
-            count=$(jq 'length' /tmp/page.json)
-            echo "  Repos on this page: $count"
-
-            [ "$count" -eq 0 ] && break
-
-            # Merge page into master file
-            jq -s '.[0] + .[1]' /tmp/source_repos.json /tmp/page.json \
-              > /tmp/source_repos_tmp.json
-            mv /tmp/source_repos_tmp.json /tmp/source_repos.json
-
-            total_so_far=$(jq 'length' /tmp/source_repos.json)
-            echo "  Running total: $total_so_far repos"
-
-            # Last page?
-            [ "$count" -lt 100 ] && break
-
-            page=$((page + 1))
-            sleep 0.5
-          done
-
-          echo ""
-          TOTAL=$(jq 'length' /tmp/source_repos.json)
-          echo "Total repos fetched: $TOTAL"
-
-          # Write names to a file for the sync step
-          jq -r '.[].name' /tmp/source_repos.json > /tmp/source_repo_names.txt
-
-          echo ""
-          echo "=== Repo list ==="
-          cat /tmp/source_repo_names.txt
-          echo "================="
-
-          echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
-
-      # ── Step 3: Sync every repo ───────────────────────────────────────────────
-      - name: Sync repositories
-        env:
-          SOURCE_TOKEN: ${{ secrets.SOURCE_GITHUB_TOKEN }}
-          DEST_TOKEN:   ${{ secrets.DEST_GITHUB_TOKEN }}
-          SOURCE_USER:  ${{ vars.SOURCE_GITHUB_USER }}
-          DEST_USER:    ${{ vars.DEST_GITHUB_USER }}
-          DRY_RUN:      ${{ github.event.inputs.dry_run || 'false' }}
-          FORCE_SYNC:   ${{ github.event.inputs.force_sync || 'false' }}
-        run: |
-          COUNT_NEW=0; COUNT_SYNCED=0; COUNT_SKIPPED=0; COUNT_FAILED=0
-
-          SUMMARY_FILE="/tmp/sync_summary.md"
-          echo "# Sync Summary — $(date -u '+%Y-%m-%d %H:%M UTC')" > "$SUMMARY_FILE"
-          echo "" >> "$SUMMARY_FILE"
-          echo "| Repo | Status | Note |" >> "$SUMMARY_FILE"
-          echo "|------|--------|------|" >> "$SUMMARY_FILE"
-
-          while IFS= read -r REPO_NAME; do
-            [ -z "$REPO_NAME" ] && continue
-
-            echo ""
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "  Repo: $REPO_NAME"
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-            META=$(jq -r --arg n "$REPO_NAME" '.[] | select(.name==$n)' /tmp/source_repos.json)
-            IS_FORK=$(echo     "$META" | jq -r '.fork')
-            IS_PRIVATE=$(echo  "$META" | jq -r '.private')
-            IS_EMPTY=$(echo    "$META" | jq -r '.size == 0')
-            DESCRIPTION=$(echo "$META" | jq -r '.description // ""')
-
-            if [ "$IS_FORK" = "true" ]; then
-              echo "  SKIP — fork"
-              COUNT_SKIPPED=$((COUNT_SKIPPED + 1))
-              echo "| \`$REPO_NAME\` | ⏭ Skipped | Fork |" >> "$SUMMARY_FILE"
-              continue
-            fi
-
-            if [ "$DRY_RUN" = "true" ]; then
-              echo "  DRY RUN — would sync"
-              COUNT_SKIPPED=$((COUNT_SKIPPED + 1))
-              echo "| \`$REPO_NAME\` | 🔍 Dry run | Would sync |" >> "$SUMMARY_FILE"
-              continue
-            fi
-
-            # Check if dest repo already exists
-            DEST_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-              -H "Authorization: Bearer $DEST_TOKEN" \
-              "https://api.github.com/repos/$DEST_USER/$REPO_NAME")
-
-            if [ "$DEST_STATUS" != "200" ]; then
-              echo "  → Creating repo on destination..."
-              SAFE_DESC=$(echo "$DESCRIPTION" | jq -Rs '.')
-              CREATE_BODY=$(jq -n \
-                --arg  name    "$REPO_NAME" \
-                --arg  desc    "$DESCRIPTION" \
-                --argjson priv "$IS_PRIVATE" \
-                '{name: $name, description: $desc, private: $priv, auto_init: false}')
-
-              HTTP_CODE=$(curl -s -o /tmp/create_resp.json -w "%{http_code}" \
-                -X POST \
-                -H "Authorization: Bearer $DEST_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/user/repos" \
-                -d "$CREATE_BODY")
-
-              if [ "$HTTP_CODE" != "201" ]; then
-                echo "  FAILED — could not create repo (HTTP $HTTP_CODE)"
-                jq -r '.message // "unknown error"' /tmp/create_resp.json
-                COUNT_FAILED=$((COUNT_FAILED + 1))
-                echo "| \`$REPO_NAME\` | ❌ Failed | Create HTTP $HTTP_CODE |" >> "$SUMMARY_FILE"
-                continue
-              fi
-              echo "  ✓ Repo created"
-              REPO_ACTION="new"
-            else
-              REPO_ACTION="sync"
-            fi
-
-            # Skip empty repos (nothing to clone)
-            if [ "$IS_EMPTY" = "true" ]; then
-              echo "  SKIP — repo has no commits yet"
-              COUNT_SKIPPED=$((COUNT_SKIPPED + 1))
-              echo "| \`$REPO_NAME\` | ⏭ Skipped | Empty |" >> "$SUMMARY_FILE"
-              continue
-            fi
-
-            WORK_DIR=$(mktemp -d)
-            SRC_URL="https://x-token-auth:${SOURCE_TOKEN}@github.com/${SOURCE_USER}/${REPO_NAME}.git"
-            DST_URL="https://x-token-auth:${DEST_TOKEN}@github.com/${DEST_USER}/${REPO_NAME}.git"
-
-            echo "  → Cloning (mirror)..."
-            if ! git clone --mirror "$SRC_URL" "$WORK_DIR" 2>&1; then
-              echo "  FAILED — clone error"
-              COUNT_FAILED=$((COUNT_FAILED + 1))
-              echo "| \`$REPO_NAME\` | ❌ Failed | Clone error |" >> "$SUMMARY_FILE"
-              rm -rf "$WORK_DIR"
-              continue
-            fi
-
-            echo "  → Pushing to destination..."
-            if ! git -C "$WORK_DIR" push --mirror "$DST_URL" 2>&1; then
-              echo "  FAILED — push error"
-              COUNT_FAILED=$((COUNT_FAILED + 1))
-              echo "| \`$REPO_NAME\` | ❌ Failed | Push error |" >> "$SUMMARY_FILE"
-              rm -rf "$WORK_DIR"
-              continue
-            fi
-
-            rm -rf "$WORK_DIR"
-
-            if [ "$REPO_ACTION" = "new" ]; then
-              echo "  ✓ NEW — created and mirrored"
-              COUNT_NEW=$((COUNT_NEW + 1))
-              echo "| \`$REPO_NAME\` | ✅ New | Created + mirrored |" >> "$SUMMARY_FILE"
-            else
-              echo "  ✓ SYNCED — branches and tags updated"
-              COUNT_SYNCED=$((COUNT_SYNCED + 1))
-              echo "| \`$REPO_NAME\` | 🔄 Synced | Updated |" >> "$SUMMARY_FILE"
-            fi
-
-            sleep 1
-
-          done < /tmp/source_repo_names.txt
-
-          echo ""
-          echo "════════════════════════════════════════════"
-          echo "  SYNC COMPLETE"
-          echo "  New     : $COUNT_NEW"
-          echo "  Synced  : $COUNT_SYNCED"
-          echo "  Skipped : $COUNT_SKIPPED"
-          echo "  Failed  : $COUNT_FAILED"
-          echo "════════════════════════════════════════════"
-
-          {
-            echo ""
-            echo "## Totals"
-            echo "- ✅ New: $COUNT_NEW"
-            echo "- 🔄 Synced: $COUNT_SYNCED"
-            echo "- ⏭ Skipped: $COUNT_SKIPPED"
-            echo "- ❌ Failed: $COUNT_FAILED"
-          } >> "$SUMMARY_FILE"
-
-          cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
-
-          [ "$COUNT_FAILED" -eq 0 ] || exit 1
-
-      # ── Step 4: Upload summary artifact ──────────────────────────────────────
-      - name: Upload sync summary
-        if: always()
-        uses: actions/upload-artifact@v4
+      # CACHE GIT MIRRORS
+      - name: Cache Git Mirrors
+        uses: actions/cache@v5
         with:
-          name: sync-summary-${{ github.run_number }}
-          path: /tmp/sync_summary.md
-          retention-days: 30
+          path: mirrors
+          key: azure-mirror-cache-${{ github.run_id }}
+          restore-keys: |
+            azure-mirror-cache-
+
+      - name: Install Required Packages
+        run: |
+
+          sudo apt update
+
+          sudo apt install jq -y
+          sudo apt install gh -y
+
+      - name: Configure Git
+        run: |
+
+          git config --global http.version HTTP/1.1
+          git config --global http.postBuffer 524288000
+          git config --global core.compression 0
+          git config --global advice.detachedHead false
+
+      - name: Create Mirrors Folder
+        run: |
+
+          mkdir -p mirrors
+
+      - name: Fetch and Sync Azure Repositories
+
+        env:
+          AZURE_PAT: ${{ secrets.AZURE_PAT }}
+          AZURE_ORG: ${{ secrets.AZURE_ORG }}
+          AZURE_PROJECT: ${{ secrets.AZURE_PROJECT }}
+
+          GH_USERNAME: ${{ secrets.GH_USERNAME }}
+
+        run: |
+
+          set +e
+
+          echo "========================================"
+          echo "AZURE DEVOPS REPOSITORY FETCH STARTED"
+          echo "========================================"
+
+          # Encode Project Name
+          ENCODED_PROJECT=$(printf '%s' "$AZURE_PROJECT" | jq -sRr @uri)
+
+          # Fetch Azure Repositories
+          RESPONSE=$(curl -s \
+            -u :$AZURE_PAT \
+            "https://dev.azure.com/$AZURE_ORG/$ENCODED_PROJECT/_apis/git/repositories?api-version=7.1-preview.1")
+
+          echo "$RESPONSE" > repos.json
+
+          # Repository Count
+          REPO_COUNT=$(jq '.value | length' repos.json)
+
+          echo ""
+          echo "========================================"
+          echo "TOTAL REPOSITORIES FOUND: $REPO_COUNT"
+          echo "========================================"
+
+          echo ""
+          echo "FETCHED REPOSITORIES:"
+          echo "----------------------------------------"
+
+          jq -r '.value[].name' repos.json
+
+          echo ""
+          echo "========================================"
+          echo "PREPARING REPOSITORY LIST"
+          echo "========================================"
+
+          # Save Repository List
+          jq -c '.value[]' repos.json > repo_items.txt
+
+          echo ""
+          echo "========================================"
+          echo "STARTING REPOSITORY SYNC"
+          echo "========================================"
+
+          # Process All Repositories
+          while IFS= read -r repoJson
+          do
+
+            echo ""
+            echo "========================================"
+
+            # Repository Name
+            REPO_NAME=$(echo "$repoJson" | jq -r '.name')
+
+            echo "PROCESSING REPOSITORY:"
+            echo "$REPO_NAME"
+
+            echo "========================================"
+
+            # Azure Remote URL
+            REMOTE_URL=$(echo "$repoJson" | jq -r '.remoteUrl')
+
+            echo ""
+            echo "Azure Clone URL:"
+            echo "$REMOTE_URL"
+
+            # Inject PAT Into URL
+            AUTH_CLONE_URL=$(echo "$REMOTE_URL" | \
+              sed "s#https://[^@]*@#https://$AZURE_PAT@#")
+
+            echo ""
+            echo "Authenticated Clone URL Generated"
+
+            # Safe Folder Name
+            SAFE_NAME=$(echo "$REPO_NAME" | tr ' /' '__')
+
+            # Mirror Path
+            MIRROR_PATH="mirrors/$SAFE_NAME.git"
+
+            echo ""
+            echo "Preparing Mirror Repository..."
+
+            # Use Cache If Exists
+            if [ -d "$MIRROR_PATH" ]; then
+
+              echo "Mirror Cache Found"
+
+              cd "$MIRROR_PATH"
+
+              git remote update
+
+              cd -
+
+            else
+
+              echo "Creating New Mirror Cache"
+
+              git clone --mirror "$AUTH_CLONE_URL" "$MIRROR_PATH"
+
+            fi
+
+            # Validate Mirror
+            if [ ! -d "$MIRROR_PATH" ]; then
+
+              echo ""
+              echo "========================================"
+              echo "CLONE FAILED:"
+              echo "$REPO_NAME"
+              echo "========================================"
+
+              continue
+
+            fi
+
+            echo ""
+            echo "Clone Successful"
+
+            echo ""
+            echo "Checking GitHub Repository..."
+
+            # Check GitHub Repository
+            gh repo view "$GH_USERNAME/$REPO_NAME" > /dev/null 2>&1
+
+            REPO_EXISTS=$?
+
+            if [ "$REPO_EXISTS" -ne 0 ]; then
+
+              echo ""
+              echo "GitHub Repository Not Found"
+
+              echo ""
+              echo "Creating GitHub Repository:"
+              echo "$GH_USERNAME/$REPO_NAME"
+
+              # Create Repository
+              gh repo create "$GH_USERNAME/$REPO_NAME" \
+                --private
+
+              CREATE_STATUS=$?
+
+              if [ "$CREATE_STATUS" -eq 0 ]; then
+
+                echo ""
+                echo "GitHub Repository Created Successfully"
+
+              else
+
+                echo ""
+                echo "GitHub Repository Creation Failed"
+
+                continue
+
+              fi
+
+            else
+
+              echo ""
+              echo "GitHub Repository Already Exists:"
+              echo "$GH_USERNAME/$REPO_NAME"
+
+            fi
+
+            # Enter Mirror Repository
+            cd "$MIRROR_PATH"
+
+            echo ""
+            echo "Removing Hidden Pull Request Refs..."
+
+            # Remove Hidden Pull Request Refs
+            git for-each-ref --format='%(refname)' refs/pull/ | \
+            xargs -r -n 1 git update-ref -d
+
+            echo ""
+            echo "Removing Large Files..."
+
+            # Remove Terraform Cache
+            git filter-branch --force --index-filter \
+            'git rm -rf --cached --ignore-unmatch .terraform' \
+            --prune-empty --tag-name-filter cat -- --all || true
+
+            echo ""
+            echo "Removing Files Larger Than 95MB..."
+
+            # Remove Large Files
+            find . -type f -size +95M -delete || true
+
+            echo ""
+            echo "Configuring GitHub Remote..."
+
+            # Remove Old Remote
+            git remote remove github 2>/dev/null || true
+
+            # Add GitHub Remote
+            git remote add github \
+            "https://$GH_USERNAME:$GH_TOKEN@github.com/$GH_USERNAME/$REPO_NAME.git"
+
+            echo ""
+            echo "Pushing Branches To GitHub..."
+
+            # Push Branches
+            git push github \
+            'refs/heads/*:refs/heads/*' \
+            --force
+
+            echo ""
+            echo "Pushing Tags To GitHub..."
+
+            # Push Tags
+            git push github \
+            'refs/tags/*:refs/tags/*' \
+            --force
+
+            echo ""
+            echo "========================================"
+            echo "REPOSITORY SYNC COMPLETED"
+            echo "========================================"
+
+            echo "Azure Repository:"
+            echo "$REPO_NAME"
+
+            echo ""
+            echo "GitHub Repository:"
+            echo "https://github.com/$GH_USERNAME/$REPO_NAME"
+
+            # Return Back
+            cd -
+
+          done < repo_items.txt
+
+          echo ""
+          echo "========================================"
+          echo "ALL REPOSITORIES SYNCED SUCCESSFULLY"
+          echo "========================================"
