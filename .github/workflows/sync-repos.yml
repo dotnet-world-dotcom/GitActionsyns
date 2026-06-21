@@ -122,7 +122,11 @@ jobs:
             echo "========================================"
 
             REPO_NAME=$(echo "$repoJson" | jq -r '.name')
+
+            #Convert Azure repo name to GitHub-safe name
+            GITHUB_REPO_NAME=$(echo "$REPO_NAME" | sed 's/[^a-zA-Z0-9._-]/-/g')
             REMOTE_URL=$(echo "$repoJson" | jq -r '.remoteUrl')
+           
 
             echo "PROCESSING REPOSITORY: $REPO_NAME"
             echo "REMOTE URL: $REMOTE_URL"
@@ -163,12 +167,11 @@ jobs:
             echo ""
             echo "Checking GitHub Repository..."
 
-            if ! gh repo view "$GH_USERNAME/$REPO_NAME" >/dev/null 2>&1; then
+            if ! gh repo view "$GH_USERNAME/$GITHUB_REPO_NAME" >/dev/null 2>&1; then
 
               echo "Repository Not Found. Creating..."
 
-              gh repo create "$GH_USERNAME/$REPO_NAME" \
-                --private
+              gh repo create "$GH_USERNAME/$GITHUB_REPO_NAME" --private
 
               echo "Repository Created"
 
@@ -188,7 +191,7 @@ jobs:
             git remote remove github 2>/dev/null || true
 
             git remote add github \
-              "https://$GH_USERNAME:$GH_TOKEN@github.com/$GH_USERNAME/$REPO_NAME.git"
+               "https://$GH_USERNAME:$GH_TOKEN@github.com/$GH_USERNAME/$GITHUB_REPO_NAME.git"
 
             echo ""
             echo "========================================"
@@ -216,7 +219,7 @@ jobs:
             echo "========================================"
 
             echo "Azure Repository: $REPO_NAME"
-            echo "GitHub Repository: https://github.com/$GH_USERNAME/$REPO_NAME"
+            echo "GitHub Repository: https://github.com/$GH_USERNAME/$GITHUB_REPO_NAME"
 
             cd -
 
