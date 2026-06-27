@@ -1,4 +1,3 @@
-```yaml
 name: Azure DevOps Repo Sync
 
 on:
@@ -230,4 +229,3 @@ jobs:
           echo "========================================"
           echo "ALL REPOSITORIES SYNCED SUCCESSFULLY"
           echo "========================================"
-```
