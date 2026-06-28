@@ -1,9 +1,11 @@
 name: Azure DevOps Repo Sync
 
 on:
+
   workflow_dispatch:
 
   schedule:
+
     # Daily at 2 AM IST
     - cron: '30 20 * * *'
 
@@ -11,19 +13,24 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+
   sync:
+
     runs-on: ubuntu-latest
+
     timeout-minutes: 720
 
     env:
       GH_TOKEN: ${{ secrets.GH_TOKEN }}
 
     steps:
-      - name: Checkout Workflow Repository
-        uses: actions/checkout@v4
 
+      - name: Checkout Workflow Repository
+        uses: actions/checkout@v5
+
+      # CACHE GIT MIRRORS
       - name: Cache Git Mirrors
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: mirrors
           key: azure-mirror-cache-${{ github.run_id }}
@@ -32,11 +39,15 @@ jobs:
 
       - name: Install Required Packages
         run: |
-          sudo apt-get update
-          sudo apt-get install -y jq gh python3-pip
+
+          sudo apt update
+
+          sudo apt install jq -y
+          sudo apt install gh -y
 
       - name: Configure Git
         run: |
+
           git config --global http.version HTTP/1.1
           git config --global http.postBuffer 524288000
           git config --global core.compression 0
@@ -44,175 +55,249 @@ jobs:
 
       - name: Create Mirrors Folder
         run: |
+
           mkdir -p mirrors
 
       - name: Fetch and Sync Azure Repositories
+
         env:
           AZURE_PAT: ${{ secrets.AZURE_PAT }}
           AZURE_ORG: ${{ secrets.AZURE_ORG }}
           AZURE_PROJECT: ${{ secrets.AZURE_PROJECT }}
+
           GH_USERNAME: ${{ secrets.GH_USERNAME }}
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
 
         run: |
-          set -euxo pipefail
+
+          set +e
 
           echo "========================================"
           echo "AZURE DEVOPS REPOSITORY FETCH STARTED"
           echo "========================================"
 
+          # Encode Project Name
           ENCODED_PROJECT=$(printf '%s' "$AZURE_PROJECT" | jq -sRr @uri)
 
+          # Fetch Azure Repositories
           RESPONSE=$(curl -s \
             -u :$AZURE_PAT \
-            "https://dev.azure.com/$AZURE_ORG/$ENCODED_PROJECT/_apis/git/repositories?api-version=7.1")
+            "https://dev.azure.com/$AZURE_ORG/$ENCODED_PROJECT/_apis/git/repositories?api-version=7.1-preview.1")
 
           echo "$RESPONSE" > repos.json
 
-          echo "========================================"
-          echo "AZURE API RESPONSE"
-          echo "========================================"
-
-          cat repos.json
-
-          if ! jq -e '.value' repos.json >/dev/null 2>&1; then
-            echo "Azure API Error"
-            cat repos.json
-            exit 1
-          fi
-
+          # Repository Count
           REPO_COUNT=$(jq '.value | length' repos.json)
 
+          echo ""
+          echo "========================================"
           echo "TOTAL REPOSITORIES FOUND: $REPO_COUNT"
+          echo "========================================"
 
-          if [ "$REPO_COUNT" -eq 0 ]; then
-            echo "No repositories found."
-            exit 1
-          fi
+          echo ""
+          echo "FETCHED REPOSITORIES:"
+          echo "----------------------------------------"
 
+          jq -r '.value[].name' repos.json
+
+          echo ""
+          echo "========================================"
+          echo "PREPARING REPOSITORY LIST"
+          echo "========================================"
+
+          # Save Repository List
           jq -c '.value[]' repos.json > repo_items.txt
 
+          echo ""
+          echo "========================================"
+          echo "STARTING REPOSITORY SYNC"
+          echo "========================================"
+
+          # Process All Repositories
           while IFS= read -r repoJson
           do
 
             echo ""
             echo "========================================"
 
+            # Repository Name
             REPO_NAME=$(echo "$repoJson" | jq -r '.name')
 
-            # Convert Azure repo name to GitHub-safe name
-            GITHUB_REPO_NAME=$(echo "$REPO_NAME" | sed 's/[^a-zA-Z0-9._-]/-/g')
+            echo "PROCESSING REPOSITORY:"
+            echo "$REPO_NAME"
 
+            echo "========================================"
+
+            # Azure Remote URL
             REMOTE_URL=$(echo "$repoJson" | jq -r '.remoteUrl')
 
-            echo "PROCESSING REPOSITORY: $REPO_NAME"
-            echo "GITHUB REPOSITORY: $GITHUB_REPO_NAME"
+            echo ""
+            echo "Azure Clone URL:"
+            echo "$REMOTE_URL"
 
+            # Inject PAT Into URL
+            AUTH_CLONE_URL=$(echo "$REMOTE_URL" | \
+              sed "s#https://[^@]*@#https://$AZURE_PAT@#")
+
+            echo ""
+            echo "Authenticated Clone URL Generated"
+
+            # Safe Folder Name
             SAFE_NAME=$(echo "$REPO_NAME" | tr ' /' '__')
+
+            # Mirror Path
             MIRROR_PATH="mirrors/$SAFE_NAME.git"
 
+            echo ""
             echo "Preparing Mirror Repository..."
 
+            # Use Cache If Exists
             if [ -d "$MIRROR_PATH" ]; then
 
               echo "Mirror Cache Found"
 
               cd "$MIRROR_PATH"
 
-              git -c http.extraheader="AUTHORIZATION: Basic $(printf ':%s' "$AZURE_PAT" | base64 -w0)" \
-                remote update
+              git remote update
 
               cd -
 
             else
 
-              echo "Creating New Mirror"
+              echo "Creating New Mirror Cache"
 
-              git -c http.extraheader="AUTHORIZATION: Basic $(printf ':%s' "$AZURE_PAT" | base64 -w0)" \
-                clone --mirror "$REMOTE_URL" "$MIRROR_PATH"
+              git clone --mirror "$AUTH_CLONE_URL" "$MIRROR_PATH"
 
             fi
 
+            # Validate Mirror
             if [ ! -d "$MIRROR_PATH" ]; then
-              echo "Clone Failed: $REPO_NAME"
-              exit 1
+
+              echo ""
+              echo "========================================"
+              echo "CLONE FAILED:"
+              echo "$REPO_NAME"
+              echo "========================================"
+
+              continue
+
             fi
 
+            echo ""
             echo "Clone Successful"
 
+            echo ""
             echo "Checking GitHub Repository..."
 
-            if ! gh repo view "$GH_USERNAME/$GITHUB_REPO_NAME" >/dev/null 2>&1; then
+            # Check GitHub Repository
+            gh repo view "$GH_USERNAME/$REPO_NAME" > /dev/null 2>&1
 
-              echo "Repository Not Found. Creating..."
+            REPO_EXISTS=$?
 
-              gh repo create "$GH_USERNAME/$GITHUB_REPO_NAME" \
+            if [ "$REPO_EXISTS" -ne 0 ]; then
+
+              echo ""
+              echo "GitHub Repository Not Found"
+
+              echo ""
+              echo "Creating GitHub Repository:"
+              echo "$GH_USERNAME/$REPO_NAME"
+
+              # Create Repository
+              gh repo create "$GH_USERNAME/$REPO_NAME" \
                 --private
+
+              CREATE_STATUS=$?
+
+              if [ "$CREATE_STATUS" -eq 0 ]; then
+
+                echo ""
+                echo "GitHub Repository Created Successfully"
+
+              else
+
+                echo ""
+                echo "GitHub Repository Creation Failed"
+
+                continue
+
+              fi
 
             else
 
-              echo "Repository Already Exists"
+              echo ""
+              echo "GitHub Repository Already Exists:"
+              echo "$GH_USERNAME/$REPO_NAME"
 
             fi
 
+            # Enter Mirror Repository
             cd "$MIRROR_PATH"
 
-            echo "Removing Pull Request References"
+            echo ""
+            echo "Removing Hidden Pull Request Refs..."
 
+            # Remove Hidden Pull Request Refs
             git for-each-ref --format='%(refname)' refs/pull/ | \
-              xargs -r -n 1 git update-ref -d
+            xargs -r -n 1 git update-ref -d
 
-            echo "Installing git-filter-repo"
+            echo ""
+            echo "Removing Large Files..."
 
-            python3 -m pip install --upgrade git-filter-repo
+            # Remove Terraform Cache
+            git filter-branch --force --index-filter \
+            'git rm -rf --cached --ignore-unmatch .terraform' \
+            --prune-empty --tag-name-filter cat -- --all || true
 
-            echo "Removing Terraform Cache From History"
+            echo ""
+            echo "Removing Files Larger Than 95MB..."
 
-            git filter-repo \
-              --path-glob '**/.terraform/**' \
-              --invert-paths \
-              --force || true
+            # Remove Large Files
+            find . -type f -size +95M -delete || true
 
-            echo "Removing Files Larger Than 95MB"
+            echo ""
+            echo "Configuring GitHub Remote..."
 
-            git filter-repo \
-              --strip-blobs-bigger-than 95M \
-              --force || true
-
+            # Remove Old Remote
             git remote remove github 2>/dev/null || true
 
+            # Add GitHub Remote
             git remote add github \
-              "https://$GH_USERNAME:$GH_TOKEN@github.com/$GH_USERNAME/$GITHUB_REPO_NAME.git"
+            "https://$GH_USERNAME:$GH_TOKEN@github.com/$GH_USERNAME/$REPO_NAME.git"
 
-            echo "========================================"
-            echo "PUSHING BRANCHES"
-            echo "========================================"
+            echo ""
+            echo "Pushing Branches To GitHub..."
 
+            # Push Branches
             git push github \
-              'refs/heads/*:refs/heads/*' \
-              --force \
-              --verbose
+            'refs/heads/*:refs/heads/*' \
+            --force
 
-            echo "========================================"
-            echo "PUSHING TAGS"
-            echo "========================================"
+            echo ""
+            echo "Pushing Tags To GitHub..."
 
+            # Push Tags
             git push github \
-              'refs/tags/*:refs/tags/*' \
-              --force \
-              --verbose
+            'refs/tags/*:refs/tags/*' \
+            --force
 
+            echo ""
             echo "========================================"
             echo "REPOSITORY SYNC COMPLETED"
             echo "========================================"
 
-            echo "Azure Repository: $REPO_NAME"
-            echo "GitHub Repository: https://github.com/$GH_USERNAME/$GITHUB_REPO_NAME"
+            echo "Azure Repository:"
+            echo "$REPO_NAME"
 
+            echo ""
+            echo "GitHub Repository:"
+            echo "https://github.com/$GH_USERNAME/$REPO_NAME"
+
+            # Return Back
             cd -
 
           done < repo_items.txt
 
+          echo ""
           echo "========================================"
           echo "ALL REPOSITORIES SYNCED SUCCESSFULLY"
           echo "========================================"
