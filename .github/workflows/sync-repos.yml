@@ -1,303 +1,285 @@
 name: Azure DevOps Repo Sync
 
 on:
-
   workflow_dispatch:
-
   schedule:
-
-    # Daily at 2 AM IST
+    # Daily at 2 AM IST (20:30 UTC)
     - cron: '30 20 * * *'
 
 env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
-
   sync:
-
     runs-on: ubuntu-latest
-
-    timeout-minutes: 720
-
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      actions: write   # required for `gh cache delete` to manage Actions caches
     env:
       GH_TOKEN: ${{ secrets.GH_TOKEN }}
 
     steps:
-
       - name: Checkout Workflow Repository
         uses: actions/checkout@v5
 
-      # CACHE GIT MIRRORS
-      - name: Cache Git Mirrors
-        uses: actions/cache@v5
+      # RESTORE GIT MIRRORS (fixed key so we always look for the latest snapshot)
+      - name: Restore Git Mirrors Cache
+        uses: actions/cache/restore@v4
         with:
           path: mirrors
-          key: azure-mirror-cache-${{ github.run_id }}
+          key: azure-mirror-cache
           restore-keys: |
-            azure-mirror-cache-
+            azure-mirror-cache
 
       - name: Install Required Packages
         run: |
-
           sudo apt update
-
-          sudo apt install jq -y
-          sudo apt install gh -y
+          sudo apt install -y jq gh python3-pip
+          pip3 install --break-system-packages --quiet git-filter-repo
 
       - name: Configure Git
         run: |
-
           git config --global http.version HTTP/1.1
           git config --global http.postBuffer 524288000
           git config --global core.compression 0
           git config --global advice.detachedHead false
+          git config --global user.email "actions@github.com"
+          git config --global user.name "github-actions"
 
       - name: Create Mirrors Folder
-        run: |
-
-          mkdir -p mirrors
+        run: mkdir -p mirrors
 
       - name: Fetch and Sync Azure Repositories
-
         env:
           AZURE_PAT: ${{ secrets.AZURE_PAT }}
           AZURE_ORG: ${{ secrets.AZURE_ORG }}
           AZURE_PROJECT: ${{ secrets.AZURE_PROJECT }}
-
           GH_USERNAME: ${{ secrets.GH_USERNAME }}
-
         run: |
-
+          # GitHub Actions runs `run:` blocks as `bash -e -o pipefail {0}` by
+          # default. That -e was silently killing this whole script the
+          # instant any git command failed (e.g. a corrupted fetch) — before
+          # our own `CLONE_STATUS=$?` / self-heal logic below ever got to run.
+          # We handle every failure explicitly via exit codes throughout this
+          # script, so turn errexit off and rely on that instead.
           set +e
+          set -uo pipefail
 
           echo "========================================"
           echo "AZURE DEVOPS REPOSITORY FETCH STARTED"
           echo "========================================"
 
-          # Encode Project Name
           ENCODED_PROJECT=$(printf '%s' "$AZURE_PROJECT" | jq -sRr @uri)
 
-          # Fetch Azure Repositories
-          RESPONSE=$(curl -s \
-            -u :$AZURE_PAT \
-            "https://dev.azure.com/$AZURE_ORG/$ENCODED_PROJECT/_apis/git/repositories?api-version=7.1-preview.1")
+          RESPONSE=$(curl -sf \
+            -u :"$AZURE_PAT" \
+            "https://dev.azure.com/$AZURE_ORG/$ENCODED_PROJECT/_apis/git/repositories?api-version=7.1-preview.1") || {
+              echo "ERROR: Failed to fetch repository list from Azure DevOps"
+              exit 1
+            }
 
           echo "$RESPONSE" > repos.json
 
-          # Repository Count
           REPO_COUNT=$(jq '.value | length' repos.json)
 
           echo ""
-          echo "========================================"
           echo "TOTAL REPOSITORIES FOUND: $REPO_COUNT"
-          echo "========================================"
-
-          echo ""
-          echo "FETCHED REPOSITORIES:"
           echo "----------------------------------------"
-
           jq -r '.value[].name' repos.json
 
-          echo ""
-          echo "========================================"
-          echo "PREPARING REPOSITORY LIST"
-          echo "========================================"
-
-          # Save Repository List
           jq -c '.value[]' repos.json > repo_items.txt
+
+          FAILED_REPOS=()
 
           echo ""
           echo "========================================"
           echo "STARTING REPOSITORY SYNC"
           echo "========================================"
 
-          # Process All Repositories
           while IFS= read -r repoJson
           do
-
             echo ""
             echo "========================================"
 
-            # Repository Name
             REPO_NAME=$(echo "$repoJson" | jq -r '.name')
+            echo "PROCESSING REPOSITORY: $REPO_NAME"
 
-            echo "PROCESSING REPOSITORY:"
-            echo "$REPO_NAME"
-
-            echo "========================================"
-
-            # Azure Remote URL
-            REMOTE_URL=$(echo "$repoJson" | jq -r '.remoteUrl')
-
-            echo ""
-            echo "Azure Clone URL:"
-            echo "$REMOTE_URL"
-
-            # Inject PAT Into URL
-            AUTH_CLONE_URL=$(echo "$REMOTE_URL" | \
-              sed "s#https://[^@]*@#https://$AZURE_PAT@#")
-
-            echo ""
-            echo "Authenticated Clone URL Generated"
-
-            # Safe Folder Name
+            # GitHub repo names can't contain spaces — sanitize the remote name
+            # separately from the local mirror folder name.
+            GH_REPO_NAME=$(echo "$REPO_NAME" | tr ' ' '-')
             SAFE_NAME=$(echo "$REPO_NAME" | tr ' /' '__')
-
-            # Mirror Path
             MIRROR_PATH="mirrors/$SAFE_NAME.git"
 
-            echo ""
-            echo "Preparing Mirror Repository..."
+            REMOTE_URL=$(echo "$repoJson" | jq -r '.remoteUrl')
 
-            # Use Cache If Exists
+            # Always inject a fresh PAT, whether or not the URL already has a
+            # user segment before the @ (the original sed silently left the
+            # URL unauthenticated when there was no existing "@").
+            AUTH_CLONE_URL=$(echo "$REMOTE_URL" | sed -E "s#https://([^@]*@)?#https://$AZURE_PAT@#")
+
+            echo "Preparing mirror repository..."
+
             if [ -d "$MIRROR_PATH" ]; then
+              echo "Mirror cache found, refreshing..."
+              (
+                cd "$MIRROR_PATH" || exit 1
+                # Reset the remote URL in case the cached PAT is stale/rotated
+                git remote set-url origin "$AUTH_CLONE_URL"
+                git fetch --prune origin
+              )
+              CLONE_STATUS=$?
 
-              echo "Mirror Cache Found"
-
-              cd "$MIRROR_PATH"
-
-              git remote update
-
-              cd -
-
-            else
-
-              echo "Creating New Mirror Cache"
-
-              git clone --mirror "$AUTH_CLONE_URL" "$MIRROR_PATH"
-
-            fi
-
-            # Validate Mirror
-            if [ ! -d "$MIRROR_PATH" ]; then
-
-              echo ""
-              echo "========================================"
-              echo "CLONE FAILED:"
-              echo "$REPO_NAME"
-              echo "========================================"
-
-              continue
-
-            fi
-
-            echo ""
-            echo "Clone Successful"
-
-            echo ""
-            echo "Checking GitHub Repository..."
-
-            # Check GitHub Repository
-            gh repo view "$GH_USERNAME/$REPO_NAME" > /dev/null 2>&1
-
-            REPO_EXISTS=$?
-
-            if [ "$REPO_EXISTS" -ne 0 ]; then
-
-              echo ""
-              echo "GitHub Repository Not Found"
-
-              echo ""
-              echo "Creating GitHub Repository:"
-              echo "$GH_USERNAME/$REPO_NAME"
-
-              # Create Repository
-              gh repo create "$GH_USERNAME/$REPO_NAME" \
-                --private
-
-              CREATE_STATUS=$?
-
-              if [ "$CREATE_STATUS" -eq 0 ]; then
-
-                echo ""
-                echo "GitHub Repository Created Successfully"
-
-              else
-
-                echo ""
-                echo "GitHub Repository Creation Failed"
-
-                continue
-
+              if [ "$CLONE_STATUS" -ne 0 ]; then
+                # A fetch failure on an existing mirror almost always means the
+                # cached objects are corrupted/incomplete (e.g. a bad prior run)
+                # rather than a transient network issue — self-heal by wiping
+                # it and re-cloning instead of failing on every run forever.
+                echo "Cached mirror appears corrupted, discarding and re-cloning..."
+                rm -rf "$MIRROR_PATH"
+                git clone --mirror "$AUTH_CLONE_URL" "$MIRROR_PATH"
+                CLONE_STATUS=$?
               fi
-
             else
-
-              echo ""
-              echo "GitHub Repository Already Exists:"
-              echo "$GH_USERNAME/$REPO_NAME"
-
+              echo "Creating new mirror cache..."
+              git clone --mirror "$AUTH_CLONE_URL" "$MIRROR_PATH"
+              CLONE_STATUS=$?
             fi
 
-            # Enter Mirror Repository
-            cd "$MIRROR_PATH"
+            if [ "$CLONE_STATUS" -ne 0 ] || [ ! -d "$MIRROR_PATH" ]; then
+              echo ""
+              echo "CLONE/UPDATE FAILED: $REPO_NAME"
+              FAILED_REPOS+=("$REPO_NAME")
+              continue
+            fi
+
+            echo "Clone/update successful"
+
+            echo "Repacking mirror to keep cache size down..."
+            (
+              cd "$MIRROR_PATH" || exit 1
+              git gc --prune=now --quiet || true
+            )
 
             echo ""
-            echo "Removing Hidden Pull Request Refs..."
+            echo "Checking GitHub repository..."
 
-            # Remove Hidden Pull Request Refs
-            git for-each-ref --format='%(refname)' refs/pull/ | \
-            xargs -r -n 1 git update-ref -d
+            if ! gh repo view "$GH_USERNAME/$GH_REPO_NAME" > /dev/null 2>&1; then
+              echo "GitHub repository not found, creating $GH_USERNAME/$GH_REPO_NAME..."
+              if ! gh repo create "$GH_USERNAME/$GH_REPO_NAME" --private; then
+                echo "GitHub repository creation FAILED: $REPO_NAME"
+                FAILED_REPOS+=("$REPO_NAME")
+                continue
+              fi
+              echo "GitHub repository created successfully"
+            else
+              echo "GitHub repository already exists: $GH_USERNAME/$GH_REPO_NAME"
+            fi
 
-            echo ""
-            echo "Removing Large Files..."
+            # Filtering/rewriting must NEVER happen on $MIRROR_PATH — that's the
+            # cached, incrementally-fetched copy. Rewriting it in place (as the
+            # previous version did with `find -delete` and filter-branch on the
+            # live mirror) can strip objects that refs still point to, silently
+            # corrupting the cache so future fetches from Azure fail forever.
+            # Instead, clone it locally into a disposable working copy, filter
+            # THAT, push from it, then throw it away.
+            PUSH_PATH="push/$SAFE_NAME.git"
+            rm -rf "$PUSH_PATH"
+            git clone --mirror "$MIRROR_PATH" "$PUSH_PATH"
+            PUSH_CLONE_STATUS=$?
 
-            # Remove Terraform Cache
-            git filter-branch --force --index-filter \
-            'git rm -rf --cached --ignore-unmatch .terraform' \
-            --prune-empty --tag-name-filter cat -- --all || true
+            if [ "$PUSH_CLONE_STATUS" -ne 0 ]; then
+              echo "LOCAL PUSH-COPY CLONE FAILED: $REPO_NAME"
+              FAILED_REPOS+=("$REPO_NAME")
+              continue
+            fi
 
-            echo ""
-            echo "Removing Files Larger Than 95MB..."
+            (
+              cd "$PUSH_PATH" || exit 1
 
-            # Remove Large Files
-            find . -type f -size +95M -delete || true
+              echo "Removing hidden pull request refs..."
+              git for-each-ref --format='%(refname)' refs/pull/ | xargs -r -n 1 git update-ref -d
 
-            echo ""
-            echo "Configuring GitHub Remote..."
+              echo "Removing .terraform paths and files larger than 95MB from history..."
+              # filter-repo drops the "origin" remote by default as a safety
+              # measure (to stop you accidentally pushing rewritten history
+              # back to the source). That's fine here — PUSH_PATH is a
+              # disposable local clone we delete after this loop iteration,
+              # its "origin" just points at $MIRROR_PATH, and we never read
+              # from it again once the push to "github" below is done.
+              git filter-repo --force \
+                --path .terraform --invert-paths \
+                --strip-blobs-bigger-than 95M
 
-            # Remove Old Remote
-            git remote remove github 2>/dev/null || true
+              echo "Configuring GitHub remote..."
+              git remote remove github 2>/dev/null || true
+              git remote add github "https://$GH_USERNAME:$GH_TOKEN@github.com/$GH_USERNAME/$GH_REPO_NAME.git"
 
-            # Add GitHub Remote
-            git remote add github \
-            "https://$GH_USERNAME:$GH_TOKEN@github.com/$GH_USERNAME/$REPO_NAME.git"
+              echo "Pushing branches to GitHub..."
+              git push github 'refs/heads/*:refs/heads/*' --force
 
-            echo ""
-            echo "Pushing Branches To GitHub..."
+              echo "Pushing tags to GitHub..."
+              git push github 'refs/tags/*:refs/tags/*' --force
+            )
+            PUSH_STATUS=$?
+            rm -rf "$PUSH_PATH"
 
-            # Push Branches
-            git push github \
-            'refs/heads/*:refs/heads/*' \
-            --force
-
-            echo ""
-            echo "Pushing Tags To GitHub..."
-
-            # Push Tags
-            git push github \
-            'refs/tags/*:refs/tags/*' \
-            --force
+            if [ "$PUSH_STATUS" -ne 0 ]; then
+              echo ""
+              echo "PUSH FAILED: $REPO_NAME"
+              FAILED_REPOS+=("$REPO_NAME")
+              continue
+            fi
 
             echo ""
             echo "========================================"
-            echo "REPOSITORY SYNC COMPLETED"
+            echo "REPOSITORY SYNC COMPLETED: $REPO_NAME"
+            echo "GitHub Repository: https://github.com/$GH_USERNAME/$GH_REPO_NAME"
             echo "========================================"
-
-            echo "Azure Repository:"
-            echo "$REPO_NAME"
-
-            echo ""
-            echo "GitHub Repository:"
-            echo "https://github.com/$GH_USERNAME/$REPO_NAME"
-
-            # Return Back
-            cd -
 
           done < repo_items.txt
 
           echo ""
           echo "========================================"
-          echo "ALL REPOSITORIES SYNCED SUCCESSFULLY"
+          if [ "${#FAILED_REPOS[@]}" -eq 0 ]; then
+            echo "ALL REPOSITORIES SYNCED SUCCESSFULLY"
+          else
+            echo "SYNC COMPLETED WITH FAILURES:"
+            printf '  - %s\n' "${FAILED_REPOS[@]}"
+          fi
           echo "========================================"
+
+          echo ""
+          MIRRORS_SIZE_MB=$(du -sm mirrors 2>/dev/null | cut -f1)
+          echo "Total mirrors cache size: ${MIRRORS_SIZE_MB} MB (Actions cache cap is ~10,240 MB per repo)"
+          if [ "${MIRRORS_SIZE_MB:-0}" -ge 8192 ]; then
+            echo "::warning::mirrors/ is at ${MIRRORS_SIZE_MB} MB, approaching the 10GB Actions cache limit. Older caches may start getting evicted, forcing full re-clones."
+          fi
+
+          if [ "${#FAILED_REPOS[@]}" -ne 0 ]; then
+            exit 1
+          fi
+
+      # actions/cache never overwrites an existing key, so the old snapshot
+      # must be deleted before the refreshed "mirrors" folder is saved back
+      # under the same key. This runs even if the sync step above failed,
+      # so partial progress isn't lost.
+      # NOTE: GH_TOKEN here is secrets.GH_TOKEN, a PAT — not the auto-generated
+      # GITHUB_TOKEN — so the `permissions:` block above does not grant it
+      # anything. gh cache delete needs the PAT itself to have Actions
+      # read/write (fine-grained PAT) or the classic "repo" scope. We no
+      # longer swallow the error silently, so a scope problem shows up here
+      # instead of the cache just quietly failing to refresh.
+      - name: Delete Previous Mirrors Cache
+        if: always()
+        run: |
+          if ! gh cache delete azure-mirror-cache --repo "$GITHUB_REPOSITORY"; then
+            echo "::warning::Could not delete previous mirrors cache — check that GH_TOKEN has Actions read/write scope. The save step below may fail to overwrite it."
+          fi
+
+      - name: Save Refreshed Mirrors Cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: mirrors
+          key: azure-mirror-cache
